@@ -425,6 +425,29 @@ struct bpf_instr insns[] = {
     BPF_STMT(BPF_RET + BPF_K, (u_int) -1),  BPF_STMT(BPF_RET + BPF_K, 0),
 };
 
+struct bpf_instr tcp_80_prog[] = {
+    { 0x28, 0, 0, 0x0000000c },
+    { 0x15, 0, 6, 0x000086dd },
+    { 0x30, 0, 0, 0x00000014 },
+    { 0x15, 0, 15, 0x00000006 },
+    { 0x28, 0, 0, 0x00000036 },
+    { 0x15, 12, 0, 0x00000050 },
+    { 0x28, 0, 0, 0x00000038 },
+    { 0x15, 10, 11, 0x00000050 },
+    { 0x15, 0, 10, 0x00000800 },
+    { 0x30, 0, 0, 0x00000017 },
+    { 0x15, 0, 8, 0x00000006 },
+    { 0x28, 0, 0, 0x00000014 },
+    { 0x45, 6, 0, 0x00001fff },
+    { 0xb1, 0, 0, 0x0000000e },
+    { 0x48, 0, 0, 0x0000000e },
+    { 0x15, 2, 0, 0x00000050 },
+    { 0x48, 0, 0, 0x00000010 },
+    { 0x15, 0, 1, 0x00000050 },
+    { 0x6, 0, 0, 0x00040000 },
+    { 0x6, 0, 0, 0x00000000 },
+};
+
 u8 arp_packet[] = "\xff\xff\xff\xff\xff\xff\x52\x54\x00\x12\x34\x56\x08\x06\x00\x01"
                   "\x08\x00\x06\x04\x00\x01\x52\x54\x00\x12\x34\x56\x0a\x00\x02\x0f"
                   "\xff\xff\xff\xff\xff\xff\x0a\x00\x02\x02";
@@ -450,4 +473,10 @@ int main()
                          mem_region{dns_packet, sizeof(dns_packet)}) == 0);
     assert(interpret_bpf(insns, sizeof(insns) / sizeof(insns[0]),
                          mem_region{tcp_packet, sizeof(tcp_packet)}) == (uint) -1);
+    assert(interpret_bpf(tcp_80_prog, sizeof(tcp_80_prog) / sizeof(tcp_80_prog[0]),
+                         mem_region{arp_packet, sizeof(arp_packet)}) == 0);
+    assert(interpret_bpf(tcp_80_prog, sizeof(tcp_80_prog) / sizeof(tcp_80_prog[0]),
+                         mem_region{dns_packet, sizeof(dns_packet)}) == 0);
+    assert(interpret_bpf(tcp_80_prog, sizeof(tcp_80_prog) / sizeof(tcp_80_prog[0]),
+                         mem_region{tcp_packet, sizeof(tcp_packet)}) == (uint) 0x00040000);
 }
