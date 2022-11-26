@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Written using https://www.freebsd.org/cgi/man.cgi?bpf and linux/{filter,bpf-common}.h as sources */
+
 using u64 = uint64_t;
 using u32 = uint32_t;
 using u16 = uint16_t;
