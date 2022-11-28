@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2022 Pedro Falcato
- * This file is  released under the terms of the MIT License
+ * This file is released under the terms of the MIT License
  * check LICENSE at the root directory for more information
  *
  * SPDX-License-Identifier: MIT
@@ -13,95 +13,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <vector>
 
 /* Written using https://www.freebsd.org/cgi/man.cgi?bpf and linux/{filter,bpf-common}.h as sources */
 
-using u64 = uint64_t;
-using u32 = uint32_t;
-using u16 = uint16_t;
-using u8 = uint8_t;
-
-struct bpf_instr
-{
-    u16 code;
-    u8 jt;
-    u8 jf;
-    u32 k;
-};
-
-union bpfi {
-    struct bpf_instr bi;
-    u64 raw;
-};
-
-#define BPF_CLASS(code) ((code) & 0x07)
-#define BPF_LD          0x0
-#define BPF_LDX         0x1
-#define BPF_ST          0x2
-#define BPF_STX         0x3
-#define BPF_ALU         0x4
-#define BPF_JMP         0x5
-#define BPF_RET         0x6
-#define BPF_MISC        0x7
-
-/* LD/LDX widths */
-/* W = 32-bits, H = 16-bits, 8 = 8-bits */
-#define BPF_SIZE(code) ((code) & 0x18)
-#define BPF_W          0x00
-#define BPF_H          0x08
-#define BPF_B          0x10
-
-/* Addressing modes */
-#define BPF_MODE(code) ((code) & 0xe0)
-#define BPF_IMM        0x00
-#define BPF_ABS        0x20
-#define BPF_IND        0x40
-#define BPF_MEM        0x60
-#define BPF_LEN        0x80
-#define BPF_MSH        0xa0
-
-/* BPF_ALU/BPF_JMP have an OP field */
-#define BPF_OP(code) ((code) & 0xf0)
-
-/* ALU ops */
-#define BPF_ADD      0x00
-#define BPF_SUB      0x10
-#define BPF_MUL      0x20
-#define BPF_DIV      0x30
-#define BPF_OR       0x40
-#define BPF_AND      0x50
-#define BPF_LSH      0x60
-#define BPF_RSH      0x70
-#define BPF_NEG      0x80
-#define BPF_MOD      0x90
-#define BPF_XOR      0xa0
-
-/* JMP ops */
-#define BPF_JA        0x00
-#define BPF_JEQ       0x10
-#define BPF_JGT       0x20
-#define BPF_JGE       0x30
-#define BPF_JSET      0x40
-
-/* SRC field - used to distinguish if rhs = K or X in a bunch of ops */
-#define BPF_SRC(code) ((code) & 0x08)
-#define BPF_K         0x00
-#define BPF_X         0x08
-
-
-#define BPF_RVAL(code) ((code) & 0x18)
-#define BPF_A          0x10
-
-/* BPF_MISC operations */
-#define BPF_MISCOP(code) ((code) & 0xf8)
-
-// TAX = A -> X
-// TXA = X -> A
-#define BPF_TAX 0x00
-#define BPF_TXA 0x80
-
-#define BPF_STMT(code, k) {(unsigned short) (code), 0, 0, k}
-#define BPF_JUMP(code, k, jt, jf) {(unsigned short) (code), jt, jf, k}
+#include "bpf_defs.h"
 
 struct mem_region
 {
@@ -187,6 +103,40 @@ void do_bpf_ld(struct bpf_state *state, struct bpf_instr *ins)
     }
 }
 
+bool validate_bpf_size(int size)
+{
+    switch (size)
+    {
+        case BPF_W:
+        case BPF_H:
+        case BPF_B:
+            return true;
+        [[unlikely]]
+        default:
+            return false;
+    }
+}
+
+bool validate_bpf_ld(struct bpf_state *state, struct bpf_instr *ins)
+{
+    auto size = BPF_SIZE(ins->code);
+    auto mode = BPF_MODE(ins->code);
+
+    switch (mode)
+    {
+        case BPF_IMM:
+        case BPF_ABS:
+        case BPF_IND:
+        case BPF_LEN:
+        case BPF_MEM:
+            break;
+        default:
+            return false; // Bad mode
+    }
+
+    return validate_bpf_size(size);
+}
+
 void do_bpf_ldx(struct bpf_state *state, struct bpf_instr *ins)
 {
     auto size = BPF_SIZE(ins->code);
@@ -213,6 +163,25 @@ void do_bpf_ldx(struct bpf_state *state, struct bpf_instr *ins)
     }
 }
 
+bool validate_bpf_ldx(struct bpf_state *state, struct bpf_instr *ins)
+{
+    auto size = BPF_SIZE(ins->code);
+    auto mode = BPF_MODE(ins->code);
+
+    switch (mode)
+    {
+        case BPF_IMM:
+        case BPF_MSH:
+        case BPF_LEN:
+        case BPF_MEM:
+            break;
+        default:
+            return false; // Bad mode
+    }
+
+    return validate_bpf_size(size);
+}
+
 void do_bpf_st(struct bpf_state *state, struct bpf_instr *ins, u32 val)
 {
     auto off = ins->k;
@@ -221,6 +190,11 @@ void do_bpf_st(struct bpf_state *state, struct bpf_instr *ins, u32 val)
         errx(1, "Bad BPF_ST to %x (M[] len %zx)\n", off, state->mem.len);
     u32 *ptr = (u32 *) state->mem.data;
     ptr[off] = val;
+}
+
+bool validate_bpf_st(struct bpf_state *state, struct bpf_instr *ins)
+{
+    return ins->k < state->mem.len;
 }
 
 void do_bpf_alu(struct bpf_state *state, struct bpf_instr *ins)
@@ -278,6 +252,48 @@ void do_bpf_alu(struct bpf_state *state, struct bpf_instr *ins)
     }
 }
 
+bool validate_bpf_alu(struct bpf_state *state, struct bpf_instr *ins)
+{
+    auto src = BPF_SRC(ins->code);
+    auto op = BPF_OP(ins->code);
+
+    switch (op)
+    {
+        case BPF_ADD:
+        case BPF_SUB:
+        case BPF_MUL:
+        case BPF_DIV:
+        case BPF_OR:
+        case BPF_AND:
+        case BPF_LSH:
+        case BPF_RSH:
+        case BPF_NEG:
+        case BPF_MOD:
+        case BPF_XOR:
+            break;
+        default:
+            return false; // Bad op
+    }
+
+    // Detect invalid ALU operations when the operand is const (K)
+
+    switch (op)
+    {
+        case BPF_DIV:
+        case BPF_MOD:
+            if (src == BPF_K && ins->k == 0)
+                return false; // Tried to divide by zero
+            break;
+        case BPF_LSH:
+        case BPF_RSH:
+            if (src == BPF_K && ins->k > 32)
+                return false; // Bad shift
+            break;
+    }
+
+    return true;
+}
+
 #define A state->acc
 #define X state->idx
 
@@ -310,6 +326,35 @@ void do_bpf_jmp(struct bpf_state *state, struct bpf_instr *ins)
     }
 }
 
+constexpr size_t bitslong = sizeof(unsigned long) * 8;
+
+bool bad_jmp(struct bpf_state *st, u32 dstpc, std::vector<unsigned long> &accessed)
+{
+    if (dstpc >= st->prog_len)
+        return true;
+    return accessed[dstpc / bitslong] & (1UL << (dstpc % bitslong));
+}
+
+bool validate_bpf_jmp(struct bpf_state *state, struct bpf_instr *ins, std::vector<unsigned long> &accessed)
+{
+    auto src = BPF_SRC(ins->code);
+    auto op = BPF_OP(ins->code);
+
+    switch (op)
+    {
+        case BPF_JA:
+            return !bad_jmp(state, state->pc + ins->k, accessed);
+        case BPF_JEQ:
+        case BPF_JGT:
+        case BPF_JGE:
+        case BPF_JSET:
+            return !bad_jmp(state, state->pc + ins->jt, accessed)
+            && !bad_jmp(state, state->pc + ins->jf, accessed);
+        default:
+            return false;
+    }
+}
+
 void do_bpf_ret(struct bpf_state *state, struct bpf_instr *ins)
 {
     auto rval = BPF_RVAL(ins->code);
@@ -332,6 +377,19 @@ void do_bpf_ret(struct bpf_state *state, struct bpf_instr *ins)
     state->ended = true;
 }
 
+bool validate_bpf_ret(struct bpf_state *state, struct bpf_instr *ins)
+{
+    auto rval = BPF_RVAL(ins->code);
+    switch (rval)
+    {
+        case BPF_K:
+        case BPF_A:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void do_bpf_misc(struct bpf_state *state, struct bpf_instr *ins)
 {
     auto op = BPF_MISCOP(ins->code);
@@ -346,6 +404,20 @@ void do_bpf_misc(struct bpf_state *state, struct bpf_instr *ins)
             break;
         default:
             errx(1, "BPF_MISC bad op %x\n", op);
+    }
+}
+
+bool validate_bpf_misc(struct bpf_state *state, struct bpf_instr *ins)
+{
+    auto op = BPF_MISCOP(ins->code);
+
+    switch (op)
+    {
+        case BPF_TAX:
+        case BPF_TXA:
+            return true;
+        default:
+            return false;
     }
 }
 
@@ -405,6 +477,57 @@ void do_interpret_bpf(struct bpf_state *state)
         state->pc++;
         do_instr(state, ins);
     }
+}
+
+bool validate_insn(struct bpf_state *state, struct bpf_instr *ins, std::vector<unsigned long>& accessed)
+{
+    auto opclass = BPF_CLASS(ins->code);
+
+    switch (opclass)
+    {
+        case BPF_LD:
+            return validate_bpf_ld(state, ins);
+        case BPF_LDX:
+            return validate_bpf_ldx(state, ins);
+        case BPF_ST:
+        case BPF_STX:
+            return validate_bpf_st(state, ins);
+        case BPF_ALU:
+            return validate_bpf_alu(state, ins);
+        case BPF_JMP:
+            return validate_bpf_jmp(state, ins, accessed);
+        case BPF_RET:
+            return validate_bpf_ret(state, ins);
+        case BPF_MISC:
+            return validate_bpf_misc(state, ins);
+        default:
+            // errx(1, "Bad bpf class %x\n", opclass);
+            return false;
+    }
+}
+
+bool validate_bpf_prog(struct bpf_state *state)
+{
+    std::vector<unsigned long> accessed;
+    accessed.resize((state->prog_len / bitslong) + (state->prog_len % bitslong != 0), 0);
+
+    while (true)
+    {
+        if (state->pc >= state->prog_len)
+        {
+            // BPF execution fell off the program. This is not an error because we do not
+            // follow jumps nor exits here.
+            break;
+        }
+
+        auto ins = state->prog + state->pc++;
+        accessed[state->pc / bitslong] |= 1UL << (state->prog_len % bitslong);
+
+        if (!validate_insn(state, ins, accessed))
+            return false;
+    }
+
+    return true;
 }
 
 size_t interpret_bpf(struct bpf_instr *prog, size_t proglen, mem_region &&data)
