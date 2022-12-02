@@ -675,7 +675,7 @@ void jit_bpf_ld(stream &strm, struct bpf_instr *ins)
             break;
         case BPF_ABS | BPF_W:
 
-            CMPi32(strm, ins->k, X86_ARG1);
+            cmp_imm_r32(strm, ins->k, X86_ARG1);
             strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK, strm.size() + 1, 0);
             JAEimm32(strm, 0);
 
@@ -688,7 +688,7 @@ void jit_bpf_ld(stream &strm, struct bpf_instr *ins)
             break;
         case BPF_ABS | BPF_H:
 
-            CMPi32(strm, ins->k, X86_ARG1);
+            cmp_imm_r32(strm, ins->k, X86_ARG1);
             strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK, strm.size() + 1, 0);
             JAEimm32(strm, 0);
             if (ins->k < 0x80)
@@ -707,7 +707,7 @@ void jit_bpf_ld(stream &strm, struct bpf_instr *ins)
             break;
         case BPF_ABS | BPF_B:
 
-            CMPi32(strm, ins->k, X86_ARG1);
+            cmp_imm_r32(strm, ins->k, X86_ARG1);
             strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK, strm.size() + 1, 0);
             JAEimm32(strm, 0);
 
