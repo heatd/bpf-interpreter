@@ -14,6 +14,11 @@ using u32 = uint32_t;
 using u16 = uint16_t;
 using u8 = uint8_t;
 
+using i64 = int64_t;
+using i32 = int32_t;
+using i16 = int16_t;
+using i8 = int8_t;
+
 struct bpf_instr
 {
     u16 code;
@@ -96,6 +101,8 @@ union bpfi {
 #define BPF_STMT(code, k) {(unsigned short) (code), 0, 0, k}
 #define BPF_JUMP(code, k, jt, jf) {(unsigned short) (code), jt, jf, k}
 
-#define BPF_MAX_INSN 4096
+#define BPF_MAX_INSN  4096
+#define BPF_MEM_WORDS 16
+#define BPF_MEM_LEN   64
 
 #endif

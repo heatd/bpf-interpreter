@@ -75,7 +75,8 @@ struct jmp_reloc
 {
     enum class jmp_type
     {
-        JMP_TYPE_REL_IMM32
+        JMP_TYPE_REL_IMM32,
+        JMP_TYPE_REL_IMM32_RET_THUNK
     } type;
 
     u32 location;
@@ -88,6 +89,7 @@ private:
     std::vector<u8> data_;
     std::deque<jmp_reloc> jmps;
     bool needs_bswap{false};
+    bool needs_err_exit{false};
 public:
     void push_back(u8 byte)
     {
@@ -96,14 +98,18 @@ public:
 
     void add_jmp(jmp_reloc::jmp_type type, u32 progpc, u32 dstbpfpc)
     {
+        if (type == jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK)
+            needs_err_exit = true;
         jmps.push_back(jmp_reloc{type, progpc, dstbpfpc});
     }
 
-    void handle_jmp(u32 bpfpc, u32 realpc)
+    void handle_jmp(u32 bpfpc, u32 realpc, bool handle_ret = false)
     {
         auto find_jmp = [&](const jmp_reloc &rel) -> bool
         {
-            return bpfpc == rel.dst_bpf_pc;
+            if (handle_ret)
+                return rel.type == jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK;
+            return rel.type != jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK && bpfpc == rel.dst_bpf_pc;
         };
     
         auto it = std::find_if(jmps.begin(), jmps.end(), find_jmp);
@@ -131,6 +137,16 @@ public:
     bool should_swap() const
     {
         return needs_bswap;
+    }
+
+    u8 mem_used() const
+    {
+        return BPF_MEM_WORDS;
+    }
+
+    bool emit_exit() const
+    {
+        return needs_err_exit;
     }
 };
 
@@ -206,6 +222,7 @@ void mov_imm_reg(stream &strm, u32 imm, int reg)
     jitl(str, srcoff)
 
 #define RET(str) jit(str, 0xc3)
+#define INT3(str) jit(str, 0xcc)
 
 #define LEA(str, src, srcoff, dstreg) \
     jit(str, 0x48); \
@@ -318,27 +335,53 @@ void mov_imm_reg(stream &strm, u32 imm, int reg)
     jit(str, 0xe8 + (reg)); \
     jitl(str, imm)
 
-void add_imm_r32(stream &strm, int reg, u32 imm)
+#define SUBi64(str, imm, reg) \
+    jit(str, REXW); \
+    jit(str, 0x81); \
+    jit(str, 0xe8 + (reg)); \
+    jitl(str, imm)
+
+void add_imm_r32(stream &strm, int reg, i32 imm)
 {
-    if (reg == EAX)
+    u32 abs = imm < 0 ? -imm : imm;
+    if (abs < 0x80)
     {
-        ADDi32AX(strm, imm);
+        jit(strm, 0x83);
+        jit(strm, 0xc0 + reg);
+        jit(strm, (u8) imm);
     }
     else
     {
-        ADDi32(strm, imm, reg);
+        if (reg == EAX)
+        {
+            ADDi32AX(strm, imm);
+        }
+        else
+        {
+            ADDi32(strm, imm, reg);
+        }
     }
 }
 
-void sub_imm_r32(stream &strm, int reg, u32 imm)
+void sub_imm_r32(stream &strm, int reg, i32 imm)
 {
-    if (reg == EAX)
+    u32 abs = imm < 0 ? -imm : imm;
+    if (abs < 0x80)
     {
-        SUBi32AX(strm, imm);
+        jit(strm, 0x83);
+        jit(strm, 0xe8 + reg);
+        jit(strm, (u8) imm);
     }
     else
     {
-        SUBi32(strm, imm, reg);
+        if (reg == EAX)
+        {
+            SUBi32AX(strm, imm);
+        }
+        else
+        {
+            SUBi32(strm, imm, reg);
+        }
     }
 }
 
@@ -492,23 +535,55 @@ void test_imm_r32(stream &strm, u32 imm, int reg)
 
 #define X86_ARG0 RDI
 #define X86_ARG1 RSI
-#define X86_ARG2 RDX
+#define X86_ARG2 RBP
 
 #define X86_A   EAX
 #define X86_X   ECX
 #define X86_TMP EBX
 
-void x86_jit_start(stream &strm)
+#define IMULimm8(str, imm, src, dst) \
+    jit(str, 0x6b); \
+    jit(str, 0xc0 | (dst) << 3 | (src)); \
+    jit(str, imm)
+
+#define IMULimm32(str, imm, src, dst) \
+    jit(str, 0x69); \
+    jit(str, 0xc0 | (dst) << 3 | (src)); \
+    jitl(str, imm)
+
+void imul_imm(stream &str, i32 imm, int src, int dst)
 {
-    PUSHrq(strm, RBP);
-    MOVr64(strm, RBP, RSP);
+    u32 abs = imm < 0 ?  -imm : imm;
+
+    if (abs < 0x80)
+    {
+        IMULimm8(str, imm, src, dst);
+    }
+    else
+    {
+        IMULimm32(str, imm, src, dst);
+    }
 }
 
-void x86_jit_end(stream &strm)
+void imul_regreg(stream &str, int src, int dst)
 {
-    POPrq(strm, RBP);
-    RET(strm);
+    jit(str, 0x0f);
+    jit(str, 0xaf);
+    jit(str, 0xc0 | dst << 3 | src);
 }
+
+#define DIV(str, src) \
+    jit(str, 0xf7); \
+    jit(str, 0xf0 | (src))
+
+#define SHLr32(str, dst) \
+    jit(str, 0xd3); \
+    jit(str, 0xe0 | (dst))
+
+#define SHRr32(str, dst) \
+    jit(str, 0xd3); \
+    jit(str, 0xe8 | (dst))
+
 
 struct bpf_instr insns[] = {
     BPF_STMT(BPF_LD + BPF_H + BPF_ABS, 12),
@@ -563,7 +638,25 @@ struct bpf_instr aluinsn[] = {
     BPF_STMT(BPF_ALU | BPF_SUB | BPF_K, 1),
     BPF_STMT(BPF_ALU | BPF_NEG, 0),
     BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0xf),
-    BPF_STMT(BPF_ALU | BPF_AND | BPF_X, 0)
+    BPF_STMT(BPF_ALU | BPF_AND | BPF_X, 0),
+    BPF_STMT(BPF_ALU | BPF_MUL | BPF_K, 2),
+    BPF_STMT(BPF_ALU | BPF_MUL | BPF_X, 0),
+    BPF_STMT(BPF_ALU | BPF_DIV | BPF_X, 0),
+    BPF_STMT(BPF_ALU | BPF_DIV | BPF_K, 2),
+    BPF_STMT(BPF_ALU | BPF_MOD | BPF_K, 2),
+    BPF_STMT(BPF_ALU | BPF_MOD | BPF_X, 0),
+    BPF_STMT(BPF_ALU | BPF_OR | BPF_K, 1),
+    BPF_STMT(BPF_ALU | BPF_OR | BPF_K, 128),
+    BPF_STMT(BPF_ALU | BPF_OR | BPF_X, 0),
+    BPF_STMT(BPF_ALU | BPF_XOR | BPF_K, 1),
+    BPF_STMT(BPF_ALU | BPF_XOR | BPF_X, 0),
+    BPF_STMT(BPF_ALU | BPF_XOR | BPF_K, 128),
+    BPF_STMT(BPF_ALU | BPF_LSH | BPF_K, 1),
+    BPF_STMT(BPF_ALU | BPF_LSH | BPF_K, 2),
+    BPF_STMT(BPF_ALU | BPF_LSH | BPF_X, 0),
+    BPF_STMT(BPF_ALU | BPF_RSH | BPF_K, 1),
+    BPF_STMT(BPF_ALU | BPF_RSH | BPF_K, 2),
+    BPF_STMT(BPF_ALU | BPF_RSH | BPF_X, 0),
 };
 
 struct bpf_instr jmpinsn[] = {
@@ -637,7 +730,7 @@ void jit_bpf_ld(stream &strm, struct bpf_instr *ins)
             MOVr64(strm, X86_ARG1, X86_A);
             break;
         case BPF_MEM:
-            MOVldl(strm, X86_ARG2, ins->k * 4UL, X86_A);
+            MOVldl(strm, X86_ARG2, -((ins->k + 1) * 4UL), X86_A);
             break;
     }
 }
@@ -660,36 +753,211 @@ void jit_bpf_ldx(stream &strm, struct bpf_instr *ins)
             MOVr64(strm, X86_ARG1, X86_X);
             break;
         case BPF_MEM:
-            MOVldl(strm, X86_ARG2, ins->k * 4UL, X86_X);
+            MOVldl(strm, X86_ARG2, -((ins->k + 1) * 4UL), X86_X);
             break;
     }
 }
 
-void jit_bpf_st(stream &strm, struct bpf_instr *ins)
+void mov_st_off8(stream &strm, int src, int reg, u8 off)
 {
-    if (ins->k < 0x80)
+    if (reg == RSP)
     {
-        // Smaller mov, but sign extends the offset (so the top bit mustn't be set)
-        MOVstli8(strm, X86_A, X86_ARG2, ins->k);
+        jit(strm, 0x89);
+        jit(strm, 1 << 6 | (src) << 3 | (reg));
+        // SIB byte
+        jit(strm, reg | (4 << 3));
+        jit(strm, (u8) (off));
     }
     else
     {
-        MOVstli32(strm, X86_A, X86_ARG2, ins->k);
+        MOVstli8(strm, src, reg, off);
     }
+}
+
+void mov_st_off32(stream &strm, int src, int reg, u32 off)
+{
+    if (reg == RSP)
+    {
+        jit(strm, 0x89);
+        jit(strm, 1 << 7 | (src) << 3 | (reg));
+        // SIB byte
+        jit(strm, reg | (4 << 3));
+        jitl(strm, off);
+    }
+    else
+    {
+        MOVstli32(strm, src, reg, off);
+    }
+}
+
+void mov_st(stream &strm, int src, int reg)
+{
+    jit(strm, 0x89);
+    jit(strm, (src) << 3 | (reg));
+    if (reg == RSP)
+    {
+        // SIB byte
+        jit(strm, reg | (4 << 3));
+    }
+}
+
+
+void mov_st_off(stream &strm, int src, int reg, i32 off)
+{
+    u32 abs_off = off < 0 ? -off : off;
+    if (abs_off == 0 && reg != RBP)
+    {
+        mov_st(strm, src, reg);
+    }
+    else if (abs_off < 0x80)
+    {
+        // Negative offsets should also work here
+        mov_st_off8(strm, src, reg, (u8) off);
+    }
+    else
+    {
+        mov_st_off32(strm, src, reg, off);    
+    }
+}
+
+
+void x86_jit_start(stream &strm)
+{
+    // Push the frame registers
+    PUSHrq(strm, RBP);
+    MOVr64(strm, RBP, RSP);
+    // Zero A and X to stop information leaks
+    // In theory if we performed more thorough verification
+    // we could only zero what we need, or error out on uninit
+    // accesses, etc.
+    // We don't need to zero TMP because it's not cbpf accessible.
+    XORr32(strm, X86_A, X86_A);
+    XORr32(strm, X86_X, X86_X);
+
+    // Allocate MEM from the stack
+    auto mem_words_used = strm.mem_used();
+    if (mem_words_used != 0)
+    {
+        SUBi64(strm, mem_words_used * 4, RSP);
+        // Zero it all
+        for (int i = 0; i < mem_words_used; i++)
+        {
+            // This uses X86_A which has already been zeroed
+            mov_st_off(strm, X86_A, RBP, (i + 1) * -4);
+        }
+    }
+}
+
+
+void jit_bpf_st(stream &strm, struct bpf_instr *ins)
+{
+    mov_st_off(strm, X86_A, RBP, (ins->k + 1) * -4);
 }
 
 void jit_bpf_stx(stream &strm, struct bpf_instr *ins)
 {
-    if (ins->k < 0x80)
+    mov_st_off(strm, X86_X, RBP, (ins->k + 1) * -4);
+}
+
+void or_i32(stream &strm, i32 imm, int reg)
+{
+    u32 abs = imm < 0 ? -imm : imm;
+
+    if (abs < 0x80)
     {
-        // Smaller mov, but sign extends the offset (so the top bit mustn't be set)
-        MOVstli8(strm, X86_X, X86_ARG2, ins->k);
+        // or imm8, reg
+        jit(strm, 0x83);
+        jit(strm, 0xc8 | reg);
+        jit(strm, (u8) imm);
     }
     else
     {
-        MOVstli32(strm, X86_X, X86_ARG2, ins->k);
+        // or imm32, %eax
+        if (reg == EAX)
+        {
+            jit(strm, 0x0d);
+            jitl(strm, imm);
+        }
+        else
+        {
+            // or imm32, reg
+            jit(strm, 0x81);
+            jit(strm, 0xc8 | reg);
+            jitl(strm, imm);
+        }
     }
 }
+
+void or_r32(stream &strm, int src, int dst)
+{
+    // or srcreg, dstreg
+    jit(strm, 0x09);
+    jit(strm, 0xc0 | src << 3 | dst);
+}
+
+void xor_imm32(stream &strm, i32 imm, int reg)
+{
+    u32 abs = imm < 0 ? -imm : imm;
+
+    if (abs < 0x80)
+    {
+        // xor imm8, reg
+        jit(strm, 0x83);
+        jit(strm, 0xf0 | reg);
+        jit(strm, (u8) imm);
+    }
+    else
+    {
+        // xor imm32, %eax
+        if (reg == EAX)
+        {
+            jit(strm, 0x35);
+            jitl(strm, imm);
+        }
+        else
+        {
+            // xor imm32, reg
+            jit(strm, 0x81);
+            jit(strm, 0xf0 | reg);
+            jitl(strm, imm);
+        }
+    }
+}
+
+void shl_imm32(stream &strm, u8 imm, int reg)
+{
+    if (imm == 1)
+    {
+        // shl $1, reg
+        jit(strm, 0xd1);
+        jit(strm, 0xe0 + reg);
+    }
+    else
+    {
+        // shl imm, reg
+        jit(strm, 0xc1);
+        jit(strm, 0xe0 + reg);
+        jit(strm, imm);
+    }
+}
+
+void shr_imm32(stream &strm, u8 imm, int reg)
+{
+    if (imm == 1)
+    {
+        // shr $1, reg
+        jit(strm, 0xd1);
+        jit(strm, 0xe8 + reg);
+    }
+    else
+    {
+        // shr imm, reg
+        jit(strm, 0xc1);
+        jit(strm, 0xe8 + reg);
+        jit(strm, imm);
+    }
+}
+
 
 void jit_bpf_alu(stream &strm, struct bpf_instr *ins)
 {
@@ -727,48 +995,71 @@ void jit_bpf_alu(stream &strm, struct bpf_instr *ins)
           case BPF_SUB | BPF_X:
             SUBr32(strm, X86_X, X86_A);
             break;
-#if 0
         case BPF_MUL | BPF_K:
-            state->acc *= rhs;
+            imul_imm(strm, ins->k, X86_A, X86_A);
             break;
-        case BPF_DIV:
-            if (rhs == 0)
-                err(1, "BPF_DIV tried to divide by zero\n");
-            state->acc /= rhs;
+        case BPF_MUL | BPF_X:
+            imul_regreg(strm, X86_X, X86_A);
             break;
-        case BPF_MOD:
-            if (rhs == 0)
-                err(1, "BPF_MOD tried to divide by zero\n");
-            state->acc %= rhs;
+        case BPF_DIV | BPF_K:
+            mov_imm_reg(strm, ins->k, X86_TMP);
+            XORr32(strm, EDX, EDX);
+            DIV(strm, X86_TMP);
             break;
-        case BPF_OR:
-            state->acc |= rhs;
+        case BPF_DIV | BPF_X:
+            TESTr32(strm, X86_X, X86_X);
+            
+            strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK, strm.size() + 1, 0);
+            JEimm32(strm, 0);
+            XORr32(strm, EDX, EDX);
+            DIV(strm, X86_X);
             break;
-        case BPF_XOR:
-            state->acc ^= rhs;
+        case BPF_MOD | BPF_K:
+            mov_imm_reg(strm, ins->k, X86_TMP);
+            XORr32(strm, EDX, EDX);
+            DIV(strm, X86_TMP);
+            MOVr32(strm, EDX, EAX);
             break;
-        case BPF_LSH:
-            // Note: rhs is unsigned so it's always >= 0
-            if (/* rhs < 0  || */ rhs > 32)
-                err(1, "BPF_LSH bad shift (%d)", rhs);
-            state->acc <<= rhs;
+        case BPF_MOD | BPF_X:
+            TESTr32(strm, X86_X, X86_X);
+            strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK, strm.size() + 1, 0);
+            JEimm32(strm, 0);
+            XORr32(strm, EDX, EDX);
+            DIV(strm, X86_X);
+            MOVr32(strm, EDX, EAX);
             break;
-        case BPF_RSH:
-            if (/* rhs < 0  || */ rhs > 32)
-                err(1, "BPF_LSH bad shift (%d)", rhs);
-            state->acc >>= rhs;
-            break;
-#endif
         case BPF_AND | BPF_K:
             and_imm_r32(strm, X86_A, ins->k);
             break;
         case BPF_AND | BPF_X:
             ANDr32(strm, X86_X, X86_A);
             break;
-#if 0
         case BPF_OR | BPF_K:
-            ORi32(strm, ins->k, X6)
-#endif
+            or_i32(strm, ins->k, X86_A);
+            break;
+        case BPF_OR | BPF_X:
+            or_r32(strm, X86_X, X86_A);
+            break;
+        case BPF_XOR | BPF_K:
+            xor_imm32(strm, ins->k, X86_A);
+            break;
+        case BPF_XOR | BPF_X:
+            XORr32(strm, X86_X, X86_A);
+            break;
+        case BPF_LSH | BPF_K:
+            shl_imm32(strm, (u8) ins->k, X86_A);
+            break;
+        case BPF_LSH | BPF_X:
+            static_assert(X86_X == ECX, "This needs X86_X = ECX to work as-is");
+            SHLr32(strm, X86_A);
+            break;
+        case BPF_RSH | BPF_K:
+            shr_imm32(strm, (u8) ins->k, X86_A);
+            break;
+        case BPF_RSH | BPF_X:
+            static_assert(X86_X == ECX, "This needs X86_X = ECX to work as-is");
+            SHRr32(strm, X86_A);
+            break;
         case BPF_NEG:
             NEGr32(strm, X86_A);
             break;
@@ -776,32 +1067,33 @@ void jit_bpf_alu(stream &strm, struct bpf_instr *ins)
 }
 
 // clang-format on
-#define EMIT_COND_JMP(strm, pc, condop, inverse)                                                  \
-    do                                                                                            \
-    {                                                                                             \
-        if (ins->jt == 0 && ins->jf == 0)                                                         \
-        {                                                                                         \
-        }                                                                                         \
-        else if (ins->jt == 0)                                                                    \
-        {                                                                                         \
-            strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32, strm.size() + 1,                \
-                         pc + ins->jf + 1);                                                       \
-            inverse(strm, 0);                                                                     \
-        }                                                                                         \
-        else if (ins->jf == 0)                                                                    \
-        {                                                                                         \
-            strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32, strm.size() + 1,                \
-                         pc + ins->jt + 1);                                                       \
-            condop(strm, 0);                                                                      \
-        }                                                                                         \
-        else                                                                                      \
-        {                                                                                         \
-            strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32, strm.size() + 1,                \
-                         pc + ins->jt + 1);                                                       \
-            condop(strm, 0);                                                                      \
-            strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32, strm.size(), pc + ins->jf + 1); \
-            JMPimm32(strm, 0);                                                                    \
-        }                                                                                         \
+#define EMIT_COND_JMP(strm, pc, condop, inverse)                                       \
+    do                                                                                 \
+    {                                                                                  \
+        if (ins->jt == 0 && ins->jf == 0)                                              \
+        {                                                                              \
+        }                                                                              \
+        else if (ins->jt == 0)                                                         \
+        {                                                                              \
+            (strm).add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32, (strm).size() + 1, \
+                           (pc) + ins->jf + 1);                                        \
+            inverse(strm, 0);                                                          \
+        }                                                                              \
+        else if (ins->jf == 0)                                                         \
+        {                                                                              \
+            (strm).add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32, (strm).size() + 1, \
+                           (pc) + ins->jt + 1);                                        \
+            condop(strm, 0);                                                           \
+        }                                                                              \
+        else                                                                           \
+        {                                                                              \
+            (strm).add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32, (strm).size() + 1, \
+                           (pc) + ins->jt + 1);                                        \
+            condop(strm, 0);                                                           \
+            (strm).add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32, (strm).size(),     \
+                           (pc) + ins->jf + 1);                                        \
+            JMPimm32(strm, 0);                                                         \
+        }                                                                              \
     } while (0)
 
 // clang-format off
@@ -869,8 +1161,10 @@ void jit_bpf_ret(stream &strm, struct bpf_instr *ins)
             break;
     }
 
+    MOVr64(strm, RBP, RSP);
     POPrq(strm, RBP);
     RET(strm);
+    INT3(strm);
 }
 
 void jit_bpf_misc(stream &strm, struct bpf_instr *ins)
@@ -930,12 +1224,28 @@ void x86_jit_bpf(stream &strm, struct bpf_instr *insn, size_t len)
     }
 }
 
+void x86_end_jit(stream &strm)
+{
+    if (!strm.emit_exit())
+        return;
+    struct bpf_instr i;
+    i.code = 0;
+    i.jf = 0;
+    i.jt = 0;
+    i.k = 0;
+    auto ip = strm.size();
+    jit_bpf_ret(strm, &i);
+
+    strm.handle_jmp(0, ip, true);
+}
+
 int main()
 {
     std::ofstream f{"jit.out", std::ios_base::out | std::ios_base::trunc};
     stream s;
     x86_jit_start(s);
-    x86_jit_bpf(s, insns, sizeof(insns) / sizeof(insns[0]));
+    x86_jit_bpf(s, aluinsn, sizeof(aluinsn) / sizeof(aluinsn[0]));
+    x86_end_jit(s);
 
     f.write((const char *) s.data(), s.size());
 
