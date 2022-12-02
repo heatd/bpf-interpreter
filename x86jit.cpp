@@ -90,6 +90,7 @@ private:
     std::deque<jmp_reloc> jmps;
     bool needs_bswap{false};
     bool needs_err_exit{false};
+    bool saved_rbx_{false};
 public:
     void push_back(u8 byte)
     {
@@ -148,6 +149,13 @@ public:
     {
         return needs_err_exit;
     }
+
+    bool saved_rbx() const
+    {
+        return saved_rbx_;
+    }
+
+    void save_rbx();
 };
 
 void jit(stream &s, u8 byte)
@@ -173,6 +181,15 @@ void jitl(stream &s, u32 word)
     jit(str, 0x50 | (reg))
 #define POPrq(str, reg) \
     jit(str, 0x58 | (reg))
+
+void stream::save_rbx()
+{
+    if (!saved_rbx_)
+    {
+        data_.insert(data_.begin(), 0x50 | RBX);
+        saved_rbx_ = true;
+    }
+}
 
 #define MODRM_REG (3 << 6)
 
@@ -722,6 +739,7 @@ void jit_bpf_ld(stream &strm, struct bpf_instr *ins)
 
             break;
         case BPF_IND | BPF_W:
+            strm.save_rbx();
             LEA(strm, X86_X, ins->k, X86_TMP);
 
             CMPr32(strm, X86_TMP, X86_ARG1);
@@ -735,6 +753,7 @@ void jit_bpf_ld(stream &strm, struct bpf_instr *ins)
             }
             break;
         case BPF_IND | BPF_H:
+            strm.save_rbx();
             LEA(strm, X86_X, ins->k, X86_TMP);
 
             CMPr32(strm, X86_TMP, X86_ARG1);
@@ -748,6 +767,7 @@ void jit_bpf_ld(stream &strm, struct bpf_instr *ins)
             }
             break;
         case BPF_IND | BPF_B:
+            strm.save_rbx();
             LEA(strm, X86_X, ins->k, X86_TMP);
 
             CMPr32(strm, X86_TMP, X86_ARG1);
@@ -1032,6 +1052,7 @@ void jit_bpf_alu(stream &strm, struct bpf_instr *ins)
             imul_regreg(strm, X86_X, X86_A);
             break;
         case BPF_DIV | BPF_K:
+            strm.save_rbx();
             mov_imm_reg(strm, ins->k, X86_TMP);
             XORr32(strm, EDX, EDX);
             DIV(strm, X86_TMP);
@@ -1045,6 +1066,7 @@ void jit_bpf_alu(stream &strm, struct bpf_instr *ins)
             DIV(strm, X86_X);
             break;
         case BPF_MOD | BPF_K:
+            strm.save_rbx();
             mov_imm_reg(strm, ins->k, X86_TMP);
             XORr32(strm, EDX, EDX);
             DIV(strm, X86_TMP);
@@ -1193,6 +1215,14 @@ void jit_bpf_ret(stream &strm, struct bpf_instr *ins)
 
     MOVr64(strm, RBP, RSP);
     POPrq(strm, RBP);
+
+    // Note: pushing and popping before/after RBP doesn't preserve the stack backtracing
+    // of the frame pointer, but it works well enough /shrug
+    if (strm.saved_rbx())
+    {
+        POPrq(strm, RBX);
+    }
+
     RET(strm);
     INT3(strm);
 }
