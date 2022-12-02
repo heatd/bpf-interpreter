@@ -674,6 +674,12 @@ void jit_bpf_ld(stream &strm, struct bpf_instr *ins)
             mov_imm_reg(strm, ins->k, X86_A);
             break;
         case BPF_ABS | BPF_W:
+
+            CMPi32(strm, ins->k, X86_ARG1);
+            strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK, strm.size() + 1, 0);
+            JAEimm32(strm, 0);
+
+            // TODO: mov off8(%reg), %reg has a shorter form.
             MOVldl(strm, X86_ARG0, ins->k, X86_A);
             if (strm.should_swap())
             {
@@ -681,6 +687,10 @@ void jit_bpf_ld(stream &strm, struct bpf_instr *ins)
             }
             break;
         case BPF_ABS | BPF_H:
+
+            CMPi32(strm, ins->k, X86_ARG1);
+            strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK, strm.size() + 1, 0);
+            JAEimm32(strm, 0);
             if (ins->k < 0x80)
             {
                 MOVzw_short(strm, X86_ARG0, ins->k, X86_A);
@@ -696,6 +706,11 @@ void jit_bpf_ld(stream &strm, struct bpf_instr *ins)
             }
             break;
         case BPF_ABS | BPF_B:
+
+            CMPi32(strm, ins->k, X86_ARG1);
+            strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK, strm.size() + 1, 0);
+            JAEimm32(strm, 0);
+
             if (ins->k < 0x80)
             {
                 MOVzb_short(strm, X86_ARG0, ins->k, X86_A);
@@ -708,6 +723,11 @@ void jit_bpf_ld(stream &strm, struct bpf_instr *ins)
             break;
         case BPF_IND | BPF_W:
             LEA(strm, X86_X, ins->k, X86_TMP);
+
+            CMPr32(strm, X86_TMP, X86_ARG1);
+            strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK, strm.size() + 1, 0);
+            JAEimm32(strm, 0);
+
             MOVldla(strm, X86_ARG0, X86_TMP, X86_A);
             if (strm.should_swap())
             {
@@ -716,6 +736,11 @@ void jit_bpf_ld(stream &strm, struct bpf_instr *ins)
             break;
         case BPF_IND | BPF_H:
             LEA(strm, X86_X, ins->k, X86_TMP);
+
+            CMPr32(strm, X86_TMP, X86_ARG1);
+            strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK, strm.size() + 1, 0);
+            JAEimm32(strm, 0);
+
             MOVzwa(strm, X86_ARG0, X86_TMP, X86_A);
             if (strm.should_swap())
             {
@@ -724,6 +749,11 @@ void jit_bpf_ld(stream &strm, struct bpf_instr *ins)
             break;
         case BPF_IND | BPF_B:
             LEA(strm, X86_X, ins->k, X86_TMP);
+
+            CMPr32(strm, X86_TMP, X86_ARG1);
+            strm.add_jmp(jmp_reloc::jmp_type::JMP_TYPE_REL_IMM32_RET_THUNK, strm.size() + 1, 0);
+            JAEimm32(strm, 0);
+
             MOVzba(strm, X86_ARG0, X86_TMP, X86_A);
             break;
         case BPF_LEN:
@@ -1244,7 +1274,7 @@ int main()
     std::ofstream f{"jit.out", std::ios_base::out | std::ios_base::trunc};
     stream s;
     x86_jit_start(s);
-    x86_jit_bpf(s, aluinsn, sizeof(aluinsn) / sizeof(aluinsn[0]));
+    x86_jit_bpf(s, ldinsn, sizeof(ldinsn) / sizeof(ldinsn[0]));
     x86_end_jit(s);
 
     f.write((const char *) s.data(), s.size());
