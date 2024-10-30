@@ -187,6 +187,8 @@ void stream::save_rbx()
     if (!saved_rbx_)
     {
         data_.insert(data_.begin(), 0x50 | RBX);
+        for (auto &j : jmps)
+                j.location += 1;
         saved_rbx_ = true;
     }
 }
